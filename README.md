@@ -237,8 +237,13 @@ A cover shows only when it belongs to the current track and has loaded. Errors a
 
 ## Notes
 
-- State is re-read every 5 s while playing (10 s idle) and 0.7 s after each command. Development Mode
-  apps have a request quota; after a 429 no request goes to Spotify's Web API (polls, keys, clicks, search,
+- State is re-read every 5 s while playing (10 s idle) and 0.7 s after each command. A held volume or seek key
+  shows every press at once but sends one request, 0.25 s after the last press. If a poll fails on the network
+  or with a 5xx, the next one waits 2 s, then 4 s, 8 s ... up to 60 s; any other answer (except a 429, which has
+  its own wait) puts the normal pace back. A pending seek is dropped by a skip or a new track, and a pending
+  volume by a device change. Search and device lists show at most 10 rows (fewer in a short pane) and scroll
+  inside, which keeps the selected row in view. Development Mode apps have a request quota; after a 429 no
+  request goes to Spotify's Web API (polls, keys, clicks, search,
   the device list, the local player's checks) until its `Retry-After` has passed. The player, search and
   device screens say how long is left; sign-in requests are not held back.
 - Choosing a search result shows that track as playing at once. Spotify takes a moment to switch and

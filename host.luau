@@ -69,6 +69,9 @@ type State = {
 	market: boolean, -- send market=from_token (is_playable/restrictions/linked_from need a market); off once Spotify refuses it
 	premute: number?,
 	blobs: { [string]: string }, -- SVG blob ids by content key: a blob is sent once, then reused every render
+	poll_fails: number, -- polls in a row that failed on the network or with a 5xx: each one waits longer
+	debounce: { [string]: TimerHandle }, -- commands waiting to be sent once their key repeat stops, by name
+	sent_at: { [string]: number }, -- when each debounced command last went out: older poll replies are stale for it
 	sd: SD,
 	shape: bridge.Shape, -- how the pane is shown (see bridge.shape): docked, glass card with focus, or the read-only glass card
 }
@@ -79,6 +82,9 @@ local POLL_IDLE_MS = 10000
 local SETTLE_MS = 700 -- Spotify applies commands asynchronously; re-read this long after one
 local EXPECT_MS = 6000 -- how long a requested track may take to show up in /me/player
 local EXPECT_RETRY_MS = 1000
+local COMMAND_DEBOUNCE_MS = 250 -- a held volume or seek key sends its last value once, not one request per repeat
+local BACKOFF_FIRST_MS = 2000 -- after a failed poll (network, 5xx): retry in 2 s, then double up to the cap
+local BACKOFF_MAX_MS = 60000
 
 -- Keys that change the pane's layout, so the window half does them (see bridge.luau). Keyed by the
 -- typed character, so shift+f (dock) differs from f (float). Each names a target state, not a toggle.
@@ -94,6 +100,62 @@ local function alive(pane: number): boolean
 		end
 	end
 	return false
+end
+
+-- Runs `fn` once, COMMAND_DEBOUNCE_MS after the last call that used `name`.
+local function debounced(state: State, name: string, fn: () -> ())
+	local waiting = state.debounce[name]
+	if waiting then
+		waiting:cancel()
+	end
+	state.debounce[name] = tern.timer(COMMAND_DEBOUNCE_MS, function()
+		state.debounce[name] = nil
+		state.sent_at[name] = tern.now()
+		fn()
+	end)
+end
+
+-- Drops the command `name` if it is still waiting for its key repeat to stop.
+local function drop_debounced(state: State, name: string)
+	local waiting: TimerHandle? = state.debounce[name]
+	if waiting then
+		waiting:cancel()
+		state.debounce[name] = nil
+	end
+end
+
+-- Drops every command still waiting for its key repeat to stop (the session they belong to is gone).
+local function cancel_debounced(state: State)
+	for name, waiting in state.debounce do
+		waiting:cancel()
+		state.debounce[name] = nil
+	end
+end
+
+-- A press is newer than a poll reply if it still waits to go out, or went out after that poll was sent
+-- (`started`): the reply then predates it and would put the old value back.
+local function newer_than(state: State, name: string, started: number): boolean
+	local waiting: TimerHandle? = state.debounce[name]
+	return waiting ~= nil or (state.sent_at[name] or -1) >= started
+end
+
+-- Keeps on screen what the user pressed when the reply `pb` to a poll sent at `started` is older than that.
+local function keep_pending(state: State, pb: spotify.Playback?, started: number)
+	local shown = state.playback
+	if not pb or not shown then
+		return
+	end
+	if newer_than(state, "volume", started) and pb.device and shown.device and pb.device.id == shown.device.id then
+		pb.device.volume = shown.device.volume
+	end
+	if newer_than(state, "seek", started) and pb.track and shown.track and pb.track.uri == shown.track.uri then
+		pb.progress_ms, pb.at = shown.progress_ms, shown.at
+	end
+end
+
+-- How long to wait after the `fails`-th failed poll in a row: 2 s, 4 s, 8 s ... up to a minute.
+local function backoff_ms(fails: number): number
+	return math.min(BACKOFF_FIRST_MS * 2 ^ (fails - 1), BACKOFF_MAX_MS)
 end
 
 -- Whether the player card is what the pane draws: the player screen, or the shortcuts screen in a pane that
@@ -134,6 +196,8 @@ end
 -- Records a failed call. Returns false when the session is gone and nothing should be retried.
 local function fail(state: State, reply: spotify.Reply): boolean
 	if reply.auth then
+		cancel_debounced(state)
+		state.poll_fails = 0
 		state.phase = "login"
 		state.mode = "player"
 		state.playback = nil
@@ -248,6 +312,7 @@ poll = function(state: State, cx: BlockCx)
 	end
 	state.inflight = true
 	local sent_market = sends_market(state)
+	local started = tern.now()
 	spotify.request(client, "GET", "/me/player", market_query(state, { { "additional_types", "track,episode" } }), nil, function(reply)
 		state.inflight = false
 		if not alive(cx.pane) then
@@ -271,6 +336,7 @@ poll = function(state: State, cx: BlockCx)
 			end
 			state.phase = "ready"
 			local pb = spotify.parse_playback(reply.json)
+			keep_pending(state, pb, started)
 			local e = state.expect
 			if e then
 				local arrived = pb ~= nil and pb.track ~= nil and (pb.track.uri == e.track.uri or pb.track.linked_uri == e.track.uri)
@@ -290,7 +356,14 @@ poll = function(state: State, cx: BlockCx)
 		cx:render()
 		if keep_going then
 			local playing = state.playback ~= nil and state.playback.playing
-			schedule(state, cx, if hold then EXPECT_RETRY_MS elseif playing then POLL_PLAYING_MS else POLL_IDLE_MS)
+			local delay = if hold then EXPECT_RETRY_MS elseif playing then POLL_PLAYING_MS else POLL_IDLE_MS
+			if not reply.ok and (reply.status == 0 or reply.status >= 500) then
+				state.poll_fails += 1
+				delay = backoff_ms(state.poll_fails)
+			elseif reply.status ~= 429 then
+				state.poll_fails = 0 -- a 429 is Spotify's own wait (honoured by spotify.request), not a sign the server is back
+			end
+			schedule(state, cx, delay)
 		end
 	end)
 end
@@ -416,7 +489,12 @@ local function seek(state: State, cx: BlockCx, delta_ms: number)
 	end
 	local target = math.floor(math.clamp(position(pb) + delta_ms, 0, math.max(pb.track.duration_ms, 0)))
 	pb.progress_ms, pb.at = target, tern.now()
-	send(state, cx, "PUT", "/me/player/seek", { { "position_ms", tostring(target) } })
+	-- Only the last of a burst of presses is sent; the bar already shows each one.
+	debounced(state, "seek", function()
+		if alive(cx.pane) then
+			send(state, cx, "PUT", "/me/player/seek", { { "position_ms", tostring(target) } })
+		end
+	end)
 end
 
 local function set_volume(state: State, cx: BlockCx, volume: number)
@@ -431,7 +509,11 @@ local function set_volume(state: State, cx: BlockCx, volume: number)
 	end
 	local v = math.clamp(math.floor(volume + 0.5), 0, 100)
 	device.volume = v
-	send(state, cx, "PUT", "/me/player/volume", { { "volume_percent", tostring(v) } })
+	debounced(state, "volume", function()
+		if alive(cx.pane) then
+			send(state, cx, "PUT", "/me/player/volume", { { "volume_percent", tostring(v) } })
+		end
+	end)
 end
 
 local function change_volume(state: State, cx: BlockCx, delta: number)
@@ -451,6 +533,7 @@ local function mute(state: State, cx: BlockCx)
 end
 
 local function skip(state: State, cx: BlockCx, direction: "next" | "previous")
+	drop_debounced(state, "seek") -- a position meant for this track would land on the next one
 	send(state, cx, "POST", "/me/player/" .. direction)
 end
 
@@ -475,6 +558,7 @@ local function cycle_repeat(state: State, cx: BlockCx)
 end
 
 local function play_track(state: State, cx: BlockCx, track: spotify.Track, device_id: string?)
+	drop_debounced(state, "seek")
 	if track.playable == false then
 		-- Spotify accepts the command (204) and then sits on it with every action disallowed.
 		state.err = `{track.name} can't be played ({track.restriction or "restricted"}).`
@@ -503,6 +587,7 @@ local function play_track(state: State, cx: BlockCx, track: spotify.Track, devic
 end
 
 local function transfer(state: State, cx: BlockCx, device: spotify.Device)
+	drop_debounced(state, "volume") -- that level was meant for the device being left
 	if not device.id then
 		state.err = `{device.name} can't be controlled from the Web API.`
 		return
@@ -1010,6 +1095,8 @@ local function enter_search(state: State, cx: BlockCx)
 end
 
 local function sign_out(state: State)
+	cancel_debounced(state)
+	state.poll_fails = 0
 	if state.timer then
 		state.timer:cancel()
 		state.timer = nil
@@ -1027,6 +1114,7 @@ end
 -- Signs in with the saved token if there is one, else asks to sign in. Also where esc on the sign-in method
 -- choice lands: the saved sign-in is still there after "Connecting", so try it again.
 local function resume(state: State, cx: BlockCx)
+	state.poll_fails = 0
 	if spotify.has_refresh_token() then
 		state.phase = "loading"
 		poll(state, cx)
@@ -1036,6 +1124,7 @@ local function resume(state: State, cx: BlockCx)
 end
 
 local function begin_client(state: State, cx: BlockCx, client_id: string, auth: spotify.AuthMode)
+	cancel_debounced(state)
 	state.auth = auth
 	state.client_id = client_id
 	local old = state.client
@@ -1168,7 +1257,13 @@ end
 
 -- Views ----------------------------------------------------------------------------------------
 
-local function tracks_list(key: string, prefix: string, tracks: { spotify.Track }, selected: number, empty: string): Node
+-- How many rows a list may take in this pane; `reserve` is what the rest of the screen uses (title, input, hint).
+-- Past it the list scrolls inside, which keeps the selected row in view.
+local function list_lines(cx: BlockCx, reserve: number): number
+	return math.clamp(cx.rows - reserve, 2, 10)
+end
+
+local function tracks_list(key: string, prefix: string, tracks: { spotify.Track }, selected: number, empty: string, lines: number): Node
 	local items = {}
 	for i, t in tracks do
 		items[i] = {
@@ -1177,7 +1272,7 @@ local function tracks_list(key: string, prefix: string, tracks: { spotify.Track 
 			value = fmt_time(t.duration_ms),
 		}
 	end
-	return keyed_list(key, prefix, items, selected, empty, BOX.search)
+	return keyed_list(key, prefix, items, selected, empty, BOX.search, lines)
 end
 
 -- Said first on every screen that offers a way in: without Premium nothing here works.
@@ -1446,7 +1541,7 @@ local function player_view(state: State, cx: BlockCx): { Node }
 	return glass_view(state, cx, pb, track, art, state.shape == "float")
 end
 
-local function search_view(state: State): { Node }
+local function search_view(state: State, cx: BlockCx): { Node }
 	local empty = if state.searching then "Searching…" elseif state.searched then "No results" else "Type a query and press Enter"
 	return {
 		header("Search", { act = "back", label = "back" }),
@@ -1458,19 +1553,19 @@ local function search_view(state: State): { Node }
 				placeholder = "Search tracks",
 				prompt = { ui.span("/ ", "muted") },
 			}),
-			tracks_list("results", "r", state.results, state.sel, empty),
+			tracks_list("results", "r", state.results, state.sel, empty, list_lines(cx, 10)),
 		}, { key = BOX.search }),
 	}
 end
 
-local function devices_view(state: State): { Node }
+local function devices_view(state: State, cx: BlockCx): { Node }
 	local items = {}
 	for i, d in state.devices do
 		items[i] = { label = d.name, detail = d.kind, value = if d.active then "active" else nil, tone = if d.active then "accent" else nil }
 	end
 	return {
 		header("Devices", { act = "back", label = "back" }),
-		panel(nil, { keyed_list("devices", "d", items, state.dsel, "No devices. Open Spotify on one, then press r.", BOX.devices) }, { key = BOX.devices }),
+		panel(nil, { keyed_list("devices", "d", items, state.dsel, "No devices. Open Spotify on one, then press r.", BOX.devices, list_lines(cx, 8)) }, { key = BOX.devices }),
 	}
 end
 
@@ -1616,9 +1711,9 @@ local function build_view(state: State, cx: BlockCx): BlockView
 		main = { panel(nil, { ui.node("spinner", { style = "dots", label = { ui.span("Connecting to Spotify", "muted") } }) }) }
 		help = "e / esc other sign-in method · L sign out"
 	elseif state.mode == "search" then
-		main, help = search_view(state), if state.focus == "input" then HINTS.input else HINTS.list
+		main, help = search_view(state, cx), if state.focus == "input" then HINTS.input else HINTS.list
 	elseif state.mode == "devices" then
-		main, help = devices_view(state), HINTS.devices
+		main, help = devices_view(state, cx), HINTS.devices
 	elseif state.mode == "help" and state.shape ~= "compact" then
 		main, help = help_view(), HINTS.help
 	elseif state.mode == "localplayer" then
@@ -1919,6 +2014,9 @@ local player: BlockDef<State> = {
 			ticking = false,
 			market = true,
 			blobs = {},
+			poll_fails = 0,
+			debounce = {},
+			sent_at = {},
 			sd = { step = "menu", gen = 0, tried = false, was_enabled = false, restoring = false },
 			shape = "docked",
 		}

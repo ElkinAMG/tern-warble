@@ -10,6 +10,8 @@ local timers = {}
 local reads = {} -- path -> how many times the plugin read it
 local queue = {} -- completed async work (fetch/process callbacks) waiting to run
 local fetch_log = {}
+local hold_polls = false -- keep the answers to /me/player polls until released (a slow network)
+local held_fetch = {}
 local routes = {} -- "METHOD host/path" -> function(req) -> { status, headers?, body? }
 local kv = {}
 local pending_nc = nil
@@ -325,9 +327,14 @@ local tern = {
 		table.insert(fetch_log, req)
 		local handler = routes[req.method .. " " .. host .. path]
 		local res = handler and handler(req) or { status = 599, body = "no route" }
-		table.insert(queue, function()
+		local deliver = function()
 			cb({ status = res.status or 200, headers = res.headers or {}, body = res.body or "", error = res.error, timed_out = false })
-		end)
+		end
+		if hold_polls and req.method == "GET" and path == "/v1/me/player" then
+			table.insert(held_fetch, deliver)
+		else
+			table.insert(queue, deliver)
+		end
 	end,
 	process = {
 		run = function(argv, opts, cb)
@@ -480,6 +487,7 @@ end
 local function reset()
 	clock, timers, queue, fetch_log, kv, pending_nc, opened = 0, {}, {}, {}, {}, nil, {}
 	blob_log = {}
+	hold_polls, held_fetch = false, {}
 	copied = nil
 	files, dirs, proc_log, proc_handler, proc_held = {}, {}, {}, nil, {}
 	env = { HOME = "/Users/test" }
@@ -818,17 +826,21 @@ do
 	check("pause: reconciled from server", state.playback.playing == false)
 
 	def.key(state, K("right"), cx)
+	advance(300) -- the burst's last press goes out once the keys stop repeating
 	settle()
 	local seek = calls("PUT", "/v1/me/player/seek")
 	check("seek: +10s from interpolated position", #seek == 1 and seek[1].query.position_ms == "40000", seek[1] and seek[1].query.position_ms)
 
 	def.key(state, K("+"), cx)
+	advance(300)
 	settle()
 	check("volume: +5", calls("PUT", "/v1/me/player/volume")[1].query.volume_percent == "45")
 	def.key(state, K("m"), cx)
+	advance(300)
 	settle()
 	check("mute: sets 0", calls("PUT", "/v1/me/player/volume")[2].query.volume_percent == "0")
 	def.key(state, K("m"), cx)
+	advance(300)
 	settle()
 	check("mute: restores", calls("PUT", "/v1/me/player/volume")[3].query.volume_percent == "45")
 
@@ -951,6 +963,7 @@ do
 	-- Clicks do what the keys do.
 	local function click(act)
 		def.event(state, { ev = "action", act = act }, cx)
+		advance(300) -- volume and seek wait for the keys to stop repeating
 		settle()
 	end
 	click("vol_up")
@@ -964,7 +977,21 @@ do
 	click("seek_fwd")
 	click("seek_back")
 	local seeks = calls("PUT", "/v1/me/player/seek")
-	check("click -10s/+10s seek by exactly 10s", #seeks == 2 and tonumber(seeks[1].query.position_ms) - tonumber(seeks[2].query.position_ms) == 10000, #seeks)
+	check("click -10s/+10s seek by 10s each (the clock moves a little between the two)", #seeks == 2 and math.abs(tonumber(seeks[1].query.position_ms) - tonumber(seeks[2].query.position_ms) - 10000) <= 400, #seeks)
+	-- A held key: every press shows at once, one request goes out with the last value.
+	local vols0, seeks0 = #calls("PUT", "/v1/me/player/volume"), #calls("PUT", "/v1/me/player/seek")
+	for _ = 1, 4 do
+		def.event(state, { ev = "action", act = "vol_up" }, cx)
+		def.event(state, { ev = "action", act = "seek_fwd" }, cx)
+		advance(100) -- a key repeating: each press restarts the wait, so 400 ms pass with nothing sent
+	end
+	check("a burst of presses sends nothing until it stops", #calls("PUT", "/v1/me/player/volume") == vols0 and #calls("PUT", "/v1/me/player/seek") == seeks0)
+	check("...yet the meter already shows the last one", state.playback.device.volume == 40, state.playback.device.volume)
+	advance(200)
+	settle()
+	local burst_v, burst_s = calls("PUT", "/v1/me/player/volume"), calls("PUT", "/v1/me/player/seek")
+	check("a burst of 4 volume presses is one request with the final value", #burst_v == vols0 + 1 and burst_v[#burst_v].query.volume_percent == "40", `{#burst_v - vols0} {burst_v[#burst_v].query.volume_percent}`)
+	check("a burst of 4 seeks is one request, to where the bar shows", #burst_s == seeks0 + 1 and tonumber(burst_s[#burst_s].query.position_ms) == state.playback.progress_ms, `{#burst_s - seeks0} {burst_s[#burst_s].query.position_ms} {state.playback.progress_ms}`)
 	click("shuffle")
 	local on = find_key(def.view(state, cx), "shuffle")
 	check("shuffle on: the icon is marked with the hi class and dotted", on.p.alt == "Shuffle on" and string.find(svg_of(on), 'class="hi"', 1, true) ~= nil and string.find(svg_of(on), "<circle", 1, true) ~= nil)
@@ -977,11 +1004,16 @@ do
 	check("OPEN SPOTIFY opens the track", opened[#opened] == "https://open.spotify.com/track/t1")
 	check("the cover links back to Spotify too", act_of(find_key(def.view(state, cx), "art")) == "open")
 	def.key(state, K("/", "/"), cx) -- search mode: a late click on a player control must be ignored
-	local before_calls = #fetch_log
-	click("vol_up")
-	click("seek_fwd")
-	click("devices")
-	check("player clicks are ignored outside the player", #fetch_log == before_calls and state.mode == "search")
+	local function sent_commands()
+		return #calls("PUT", "/v1/me/player/volume") + #calls("PUT", "/v1/me/player/seek") + #calls("GET", "/v1/me/player/devices")
+	end
+	local before_calls = sent_commands()
+	for _, act in { "vol_up", "seek_fwd", "devices" } do
+		def.event(state, { ev = "action", act = act }, cx)
+	end
+	advance(300) -- a press that was wrongly accepted would be sent by now
+	settle()
+	check("player clicks are ignored outside the player", sent_commands() == before_calls and state.mode == "search")
 	state.mode = "player"
 	click("devices")
 	check("device label opens the picker", state.mode == "devices")
@@ -1014,6 +1046,100 @@ do
 	settle()
 	local n = renders_in(4000)
 	check("resume: the tick starts with the key alone", n >= 4, n)
+
+
+	-- A poll that lands inside the wait must not undo presses that have not gone out yet.
+	state = signed_in_player()
+	local polls0 = #calls("GET", "/v1/me/player")
+	for _ = 1, 3000 do
+		if #calls("GET", "/v1/me/player") > polls0 then
+			break
+		end
+		advance(10)
+	end
+	polls0 = #calls("GET", "/v1/me/player")
+	local every = if state.playback and state.playback.playing then 5000 else 10000
+	advance(every - 150) -- the next poll is due in about 150 ms
+	def.event(state, { ev = "action", act = "vol_up" }, cx)
+	def.event(state, { ev = "action", act = "seek_fwd" }, cx)
+	local shown = state.playback.progress_ms
+	advance(200) -- the poll lands (150 ms), the wait (250 ms) is not over
+	check("a poll answered inside the wait", #calls("GET", "/v1/me/player") == polls0 + 1, #calls("GET", "/v1/me/player") - polls0)
+	check("...keeps the pending volume and position on screen", state.playback.device.volume == 50 and state.playback.progress_ms >= shown, `{state.playback.device.volume} {state.playback.progress_ms} {shown}`)
+	advance(200)
+	settle()
+	local last_v = calls("PUT", "/v1/me/player/volume")
+	check("...and they are what gets sent", last_v[#last_v].query.volume_percent == "50", last_v[#last_v].query.volume_percent)
+
+	-- Signing out drops presses still waiting: nothing goes out under the old session.
+	state = signed_in_player()
+	local sent0 = #calls("PUT", "/v1/me/player/volume")
+	def.event(state, { ev = "action", act = "vol_up" }, cx)
+	def.key(state, K("L", "L"), cx)
+	advance(500)
+	settle()
+	check("sign-out cancels a pending volume press", state.phase == "login" and #calls("PUT", "/v1/me/player/volume") == sent0 and state.err == nil, `{state.phase} {tostring(state.err)}`)
+
+	-- ...nor one that was sent before the press went out and answers after it did (a slow network).
+	state = signed_in_player()
+	polls0 = #calls("GET", "/v1/me/player")
+	for _ = 1, 3000 do
+		if #calls("GET", "/v1/me/player") > polls0 then
+			break
+		end
+		advance(10)
+	end
+	polls0 = #calls("GET", "/v1/me/player")
+	every = if state.playback and state.playback.playing then 5000 else 10000
+	advance(every - 150)
+	hold_polls = true
+	def.event(state, { ev = "action", act = "vol_up" }, cx)
+	def.event(state, { ev = "action", act = "seek_fwd" }, cx)
+	local pressed_at = state.playback.progress_ms
+	advance(200) -- the poll goes out (150 ms) and its answer is held
+	check("a poll is waiting for its answer", #held_fetch == 1 and #calls("GET", "/v1/me/player") == polls0 + 1, `{#held_fetch} {#calls("GET", "/v1/me/player") - polls0}`)
+	advance(100) -- the wait is over: the press goes out while the poll's answer is still on its way
+	settle()
+	local sent_vols = calls("PUT", "/v1/me/player/volume")
+	check("...the press went out first", sent_vols[#sent_vols].query.volume_percent == "50", sent_vols[#sent_vols].query.volume_percent)
+	hold_polls = false
+	for _, deliver in held_fetch do
+		table.insert(queue, deliver)
+	end
+	held_fetch = {}
+	settle()
+	check("a stale poll answer does not put the old volume back", state.playback.device.volume == 50, state.playback.device.volume)
+	check("...nor the old position", state.playback.progress_ms >= pressed_at, `{state.playback.progress_ms} {pressed_at}`)
+
+	-- A seek still waiting must not follow a skip onto the next track.
+	state = signed_in_player()
+	local seeks_before = #calls("PUT", "/v1/me/player/seek")
+	def.event(state, { ev = "action", act = "seek_fwd" }, cx)
+	def.event(state, { ev = "action", act = "next" }, cx)
+	advance(300)
+	settle()
+	check("a pending seek is dropped by a skip", #calls("PUT", "/v1/me/player/seek") == seeks_before and #calls("POST", "/v1/me/player/next") == 1, `{#calls("PUT", "/v1/me/player/seek") - seeks_before} {#calls("POST", "/v1/me/player/next")}`)
+	-- A server that keeps failing (an HTTP 503, or no connection at all) is asked less and less often, and
+	-- normal pace comes back when it answers.
+	for kind, down in {
+		http503 = function()
+			return ok(503, { error = { status = 503, message = "down" } })
+		end,
+		network = function()
+			return { error = "connection refused" }
+		end,
+	} do
+		state = signed_in_player()
+		local good_route = routes["GET api.spotify.com/v1/me/player"]
+		routes["GET api.spotify.com/v1/me/player"] = down
+		local asked0 = #calls("GET", "/v1/me/player")
+		advance(31000)
+		local asked = #calls("GET", "/v1/me/player") - asked0
+		check(`failing polls back off ({kind}): 4 in 31 s, not 6`, asked == 4 and state.poll_fails == 4, `{asked} {state.poll_fails}`)
+		routes["GET api.spotify.com/v1/me/player"] = good_route
+		advance(40000)
+		check(`polling recovers and the back-off resets ({kind})`, state.poll_fails == 0 and state.err == nil, `{state.poll_fails} {tostring(state.err)}`)
+	end
 
 	state = signed_in_player()
 	set_current(playback({ is_playing = false }))
@@ -1324,6 +1450,14 @@ do
 	local box = find_key(def.view(state, cx), "search_box")
 	local kids = if box then box.c or {} else {}
 	check("search: the query input and the results are direct children of the keyed panel the ids and the focus name", #kids == 2 and kids[1].p.key == "query" and kids[2].p.key == "results")
+	local rows_before = cx.rows
+	local capped = {}
+	for _, r in { 8, 14, 24, 60 } do
+		cx.rows = r
+		table.insert(capped, find_key(def.view(state, cx), "results").p.max.lines)
+	end
+	cx.rows = rows_before
+	check("results: the list's height follows the pane's rows (never under 2 or over 10) so the selected row can scroll into view", table.concat(capped, ",") == "2,4,10,10", table.concat(capped, ","))
 	state.sel = 5
 	check("results: a selection past the end names no row", find_key(def.view(state, cx), "results").p.selected == nil)
 	def.event(state, { ev = "select", item = rows.p.selected }, cx)
