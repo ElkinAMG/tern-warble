@@ -2,7 +2,7 @@
 
 A Spotify player block for [Tern](https://stencil.so/tern) that talks to the Spotify Web API directly
 (Authorization Code + PKCE). It controls any Spotify Connect device (the desktop app, your phone, a speaker,
-or a headless `spotifyd`) and works on remote hosts: cover art, SVG transport controls in the terminal's
+or a headless `spotifyd`): cover art, SVG transport controls in the terminal's
 theme colours, a progress bar, seek, volume, shuffle/repeat, a device picker and track search. It plays no audio itself; an
 optional [local player](#local-player-play-on-this-mac-with-no-spotify-app) installs `spotifyd` so this Mac
 can be the device.
@@ -89,9 +89,10 @@ to end against Spotify's real servers.** Everything else in this README uses the
 Update with `tern plugin install git@github.com:ElkinAMG/tern-warble.git --force` (never replaces a linked copy);
 remove with `tern plugin remove spotify-api`.
 
-**Why spotifyd is installed, not bundled.** It is GPL-3.0 and this plugin is MIT, so its code and binaries are
-not in this repository, and its macOS release binaries did not run here without Homebrew's libraries (see the
-local player section). The plugin automates the install instead, so there is nothing for you to build.
+**Why spotifyd is installed, not bundled.** Its macOS release binaries did not run here without Homebrew's
+libraries (see the local player section), and shipping a GPL-3.0 program inside this MIT repository would bring
+the GPL's obligations (licence text, source offer) with it. So its code and binaries are not in this repository;
+the plugin automates the install instead, so there is nothing for you to build. It does need Homebrew.
 
 ### Signing in, details
 
