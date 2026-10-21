@@ -68,13 +68,13 @@ to end against Spotify's real servers.** Everything else in this README uses the
 
 ## Install
 
-1. Install the plugin. This repository is private, so Git needs access to it (SSH keys or `gh auth login`):
+1. Install the plugin:
 
    ```sh
-   tern plugin install git@github.com:ElkinAMG/tern-warble.git
+   tern plugin install github.com/ElkinAMG/tern-warble
    ```
 
-   Or from a clone: `git clone git@github.com:ElkinAMG/tern-warble.git && tern plugin install ./tern-warble`.
+   Or from a clone: `git clone https://github.com/ElkinAMG/tern-warble && tern plugin install ./tern-warble`.
    To hack on it in place use `tern plugin link ./tern-warble` instead. Check with `tern plugin list`: the
    `spotify-api` line must end in `ready`.
 2. Pick how to sign in (see [Two ways to sign in](#two-ways-to-sign-in)). The recommended one takes about two
@@ -86,7 +86,7 @@ to end against Spotify's real servers.** Everything else in this README uses the
    spotifyd` for you; then `1` (pair from your phone) or `2` (sign in with the browser), which starts it once
    the login works. See [Local player](#local-player-play-on-this-mac-with-no-spotify-app).
 
-Update with `tern plugin install git@github.com:ElkinAMG/tern-warble.git --force` (never replaces a linked copy);
+Update with `tern plugin install github.com/ElkinAMG/tern-warble --force` (never replaces a linked copy);
 remove with `tern plugin remove spotify-api`.
 
 **Why spotifyd is installed, not bundled.** Its macOS release binaries did not run here without Homebrew's
