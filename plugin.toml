@@ -1,0 +1,13 @@
+schema = 1
+id = "spotify-api"
+name = "Spotify (Web API)"
+version = "0.1.0"
+description = "Spotify player for Tern over the Web API: cover art, transport, volume, devices and search."
+icon = "sparkle"
+host = "host.luau"
+window = "window.luau"
+styles = ["spotify.css"]
+
+[[blocks]]
+id = "web-player"
+title = "Spotify (Web API)"

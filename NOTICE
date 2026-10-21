@@ -1,0 +1,33 @@
+Warble (Spotify for Tern): acknowledgements
+===========================================
+
+This plugin is released under the MIT License (see LICENSE).
+
+It is an independent project. It is not made, endorsed or sponsored by
+Spotify AB. "Spotify" is a trademark of Spotify AB.
+
+This package contains no source code, binaries or documentation text from
+the projects below. They are credited because this plugin would not be
+possible, or would be much poorer, without them.
+
+librespot
+  https://github.com/librespot-org/librespot
+  MIT License, Copyright (c) 2015 Paul Lietar, and its contributors.
+  An open source Spotify client library. Its source is where the client id
+  that the "Keymaster" sign-in option uses (KEYMASTER_CLIENT_ID in
+  core/src/config.rs) was found. That is a single public identifier, not a
+  copy of any of its code.
+
+spotifyd
+  https://github.com/Spotifyd/spotifyd
+  GNU General Public License v3.0.
+  A Spotify Connect daemon built on librespot. Its sign-in flow is where the
+  loopback redirect used by the "Keymaster" option (127.0.0.1:8000/login)
+  was observed. The optional local player installs it with Homebrew and runs
+  it as a separate program (a LaunchAgent): it builds its command line,
+  reads its log and stops it, but includes, copies, links to and modifies
+  none of its code. Whether that leaves this package outside the GPL is for
+  you to judge; this is not legal advice.
+
+Thanks to the authors and maintainers of both projects for the years of work
+that made playing Spotify from the terminal practical.
