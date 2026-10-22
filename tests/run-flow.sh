@@ -12,7 +12,7 @@ trap 'rm -f "$out"' EXIT
 			echo "local __modules, __loaded = {}, {}"
 			# shellcheck disable=SC2016
 			echo 'local function __require(p) local n = string.match(p, "([%w_]+)$"); if not __loaded[n] then __loaded[n] = __modules[n]() end; return __loaded[n] end'
-			for m in pkce field bridge spotify viz spotifyd ui/core ui/panel ui/list ui/keycaps host; do
+			for m in pkce field bridge secret spotify viz spotifyd ui/core ui/panel ui/list ui/keycaps host; do
 				echo "__modules.${m##*/} = function()"
 				sed 's/require(/__require(/g' "$root/$m.luau"
 				echo "end"

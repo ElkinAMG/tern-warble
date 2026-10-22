@@ -1,8 +1,10 @@
 --!strict
 -- Spotify Web API client: Authorization Code + PKCE sign-in, token refresh, and the
--- player/search calls the block uses. Host half only (needs tern.fetch/process/kv).
+-- player/search calls the block uses. Host half only (needs tern.fetch/process/kv). The refresh token lives
+-- in the macOS Keychain (secret.luau); kv keeps only what is not secret.
 
 local pkce = require("./pkce")
+local secret = require("./secret")
 
 local M = {}
 
@@ -50,6 +52,12 @@ export type Client = {
 	waiting: { (err: string?, auth: boolean?) -> () }?, -- callers parked on an in-flight refresh
 	retry_until: number, -- tern.now() before which Spotify asked us not to call (a 429's Retry-After)
 	retry_reason: string?, -- the reason that 429 gave (QUOTA_EXCEEDED reads differently)
+	epoch: number, -- bumped when the sign-in ends here: answers to older requests are dropped, not stored
+	mem: string?, -- the refresh token last seen, used only while the Keychain cannot be read or has never held it
+	mem_gen: number, -- the sign-out count when `mem` was taken: a token from before a sign-out is not used
+	loading: { (has: boolean, warn: string?) -> () }?, -- callers parked on the first read of the token
+	warn: string?, -- why the sign-in is not (or not safely) saved, for the block to show
+	unsaved: boolean, -- the token in `mem` is not in the Keychain yet: saving is tried again on each refresh
 }
 
 export type Login = { url: string, verifier: string, state: string }
@@ -151,8 +159,25 @@ end
 
 -- Tokens ---------------------------------------------------------------------------------------
 
+-- Bumped by every sign-out (any pane): a refresh that began before it must not store its rotated token.
+local signed_out = 0
+
 function M.new(client_id: string, mode: AuthMode): Client
-	return { client_id = client_id, mode = mode, token = nil, expires = 0, waiting = nil, retry_until = 0, retry_reason = nil }
+	return {
+		client_id = client_id,
+		mode = mode,
+		token = nil,
+		expires = 0,
+		waiting = nil,
+		retry_until = 0,
+		retry_reason = nil,
+		epoch = 0,
+		mem = nil,
+		mem_gen = 0,
+		loading = nil,
+		warn = nil,
+		unsaved = false,
+	}
 end
 
 -- Milliseconds still to wait because of a 429 (0: none).
@@ -160,9 +185,78 @@ function M.retry_in(c: Client): number
 	return math.max(0, c.retry_until - tern.now())
 end
 
-function M.has_refresh_token(): boolean
+-- The refresh token an earlier version left in kv.json (nil when there is none).
+local function legacy_token(): string?
 	local rt = tern.kv.get("refresh_token")
-	return type(rt) == "string" and rt ~= ""
+	if type(rt) == "string" and rt ~= "" then
+		return rt
+	end
+	return nil
+end
+
+-- Removes that old copy (only if it is `token`, when one is given).
+local function drop_legacy(token: string?)
+	local rt = legacy_token()
+	if rt and (token == nil or rt == token) then
+		tern.kv.set("refresh_token", nil)
+	end
+end
+
+-- Finds the saved sign-in: the Keychain's token, else the one an earlier version kept in kv.json, which is
+-- moved to the Keychain (and removed from kv.json only once it reads back). cb(has, warning): a warning
+-- means the sign-in works but is not safely saved. Callers that arrive meanwhile share the answer.
+function M.load(c: Client, cb: (boolean, string?) -> ())
+	if c.loading then
+		table.insert(c.loading, cb)
+		return
+	end
+	c.loading = { cb }
+	local epoch = c.epoch
+	local gen0 = signed_out -- a sign-out while the Keychain is being read makes what it returned stale
+	local function done(has: boolean, warn: string?)
+		local parked: { (boolean, string?) -> () } = c.loading or {}
+		c.loading = nil
+		for _, waiter in parked do
+			waiter(has, warn)
+		end
+	end
+	secret.get(secret.default, function(token, err)
+		if c.epoch ~= epoch then
+			done(false, nil)
+			return
+		end
+		if token then
+			c.mem, c.mem_gen, c.unsaved, c.warn = token, gen0, false, nil
+			drop_legacy(nil) -- the Keychain is the truth: an old plaintext copy has no reason to stay
+			done(true, nil)
+			return
+		end
+		local old = legacy_token()
+		if not old then
+			c.warn = err
+			done(false, err)
+			return
+		end
+		c.mem, c.mem_gen = old, gen0
+		c.unsaved = true -- saved again by the next refresh, once the Keychain answers
+		if err then
+			c.warn = err .. " The sign-in saved by an earlier version is used meanwhile."
+			done(true, c.warn)
+			return
+		end
+		secret.set(secret.default, old, function(ok, serr)
+			if c.epoch ~= epoch then
+				done(false, nil)
+			elseif ok then
+				drop_legacy(old)
+				c.unsaved, c.warn = false, nil
+				done(true, nil)
+			else
+				c.warn = serr
+				done(true, serr)
+			end
+		end)
+	end)
 end
 
 -- Scopes Spotify actually granted (its token replies list them). Empty until the first token reply.
@@ -171,11 +265,28 @@ function M.has_scope(name: string): boolean
 	return type(granted) == "string" and string.find(" " .. granted .. " ", " " .. name .. " ", 1, true) ~= nil
 end
 
-function M.sign_out(c: Client)
-	c.token = nil
-	c.expires = 0
+-- Forgets the saved sign-in: the Keychain item and any copy an earlier version left in kv.json. cb hears
+-- whether the Keychain item is gone. Refreshes that started earlier, in any pane, no longer save their token.
+function M.forget(cb: ((boolean, string?) -> ())?)
+	signed_out += 1
 	tern.kv.set("refresh_token", nil)
 	tern.kv.set("scope", nil)
+	secret.delete(secret.default, function(ok, err)
+		if cb then
+			cb(ok, err)
+		end
+	end)
+end
+
+-- This client no longer holds a sign-in (a replacement is taking over, or the user signed out).
+function M.retire(c: Client)
+	c.epoch += 1
+	c.token, c.expires, c.mem, c.unsaved, c.warn = nil, 0, nil, false, nil
+end
+
+function M.sign_out(c: Client, cb: ((boolean, string?) -> ())?)
+	M.retire(c)
+	M.forget(cb)
 end
 
 local function token_request(form: { { string } }, cb: (Reply) -> ())
@@ -189,19 +300,48 @@ local function token_request(form: { { string } }, cb: (Reply) -> ())
 	end)
 end
 
--- Keeps the access token in memory only; the refresh token is the one secret that persists.
-local function store(c: Client, json: any)
+-- The access token stays in memory only, with the scopes Spotify granted.
+local function store_access(c: Client, json: any): boolean
 	if type(json) ~= "table" or type(json.access_token) ~= "string" then
-		return
+		return false
 	end
 	c.token = json.access_token
 	-- Renew a minute early so a request never leaves with a token about to lapse.
 	c.expires = tern.now() + (tonumber(json.expires_in) or 3600) * 1000 - 60000
-	if type(json.refresh_token) == "string" and json.refresh_token ~= "" then
-		tern.kv.set("refresh_token", json.refresh_token)
-	end
 	if type(json.scope) == "string" then
 		tern.kv.set("scope", json.scope)
+	end
+	return true
+end
+
+-- The refresh token is the one secret that persists, in the Keychain. A failure keeps it in memory (the
+-- session works) and says so in `c.warn`; it is never written to kv.json. `epoch` is the client's when
+-- the request that brought the token started; callers have just checked it, and the answer from the
+-- Keychain is dropped if the sign-in ended meanwhile.
+local function persist(c: Client, epoch: number, token: string, cb: (() -> ())?)
+	c.mem, c.mem_gen = token, signed_out
+	secret.set(secret.default, token, function(ok, err)
+		if c.epoch == epoch then
+			c.unsaved = not ok
+			c.warn = if ok then nil else err
+			if ok then
+				drop_legacy(nil)
+			end
+		end
+		if cb then
+			cb()
+		end
+	end)
+end
+
+local function store(c: Client, json: any, epoch: number)
+	if c.epoch ~= epoch or not store_access(c, json) then
+		return
+	end
+	if type(json.refresh_token) == "string" and json.refresh_token ~= "" then
+		persist(c, epoch, json.refresh_token, nil)
+	elseif c.unsaved and c.mem then
+		persist(c, epoch, c.mem, nil) -- a refresh that brought no new token still retries the save
 	end
 end
 
@@ -210,29 +350,73 @@ local function refresh(c: Client, cb: (string?, boolean?) -> ())
 		table.insert(c.waiting, cb)
 		return
 	end
-	local rt = tern.kv.get("refresh_token")
-	if type(rt) ~= "string" or rt == "" then
-		cb("Not signed in", true)
-		return
-	end
 	c.waiting = { cb }
-	token_request({ { "grant_type", "refresh_token" }, { "refresh_token", rt }, { "client_id", c.client_id } }, function(reply)
+	local epoch = c.epoch
+	local gen = signed_out -- another pane's sign-out after this point must not be undone by this refresh
+	local function finish(err: string?, auth: boolean?)
 		local parked: { (string?, boolean?) -> () } = c.waiting or {}
 		c.waiting = nil
-		local err: string? = nil
-		local auth: boolean? = nil
-		if reply.ok then
-			store(c, reply.json)
-		else
-			-- 400/401 means the refresh token (or client id) is no good; a network error or 5xx doesn't.
-			auth = reply.status == 400 or reply.status == 401
-			if auth then
-				tern.kv.set("refresh_token", nil)
-			end
-			err = reply.err or "Token refresh failed"
-		end
 		for _, waiter in parked do
 			waiter(err, auth)
+		end
+	end
+	local function request(rt: string, retried: boolean)
+		token_request({ { "grant_type", "refresh_token" }, { "refresh_token", rt }, { "client_id", c.client_id } }, function(reply)
+			if c.epoch ~= epoch then
+				finish("Not signed in", true)
+				return
+			end
+			if reply.ok then
+				if signed_out ~= gen then -- another pane signed out while this was on the wire: nothing is kept
+					c.mem, c.unsaved = nil, false
+					finish("Not signed in", true)
+					return
+				end
+				c.mem, c.mem_gen = rt, gen
+				store(c, reply.json, epoch)
+				finish(nil, nil)
+				return
+			end
+			local err = reply.err or "Token refresh failed"
+			-- 400/401 means the refresh token (or client id) is no good; a network error or 5xx doesn't.
+			if reply.status ~= 400 and reply.status ~= 401 then
+				finish(err, nil)
+				return
+			end
+			-- Another pane may have stored a newer token since: try that one once. Otherwise forget this one,
+			-- and only if it is still what is saved.
+			secret.get(secret.default, function(current)
+				if c.epoch ~= epoch then
+					finish("Not signed in", true)
+				elseif current and current ~= rt and not retried then
+					request(current, true)
+				else
+					secret.delete_if(secret.default, rt, function() end)
+					drop_legacy(rt)
+					c.mem = nil
+					finish(err, true)
+				end
+			end)
+		end)
+	end
+	secret.get(secret.default, function(token, gerr)
+		if c.epoch ~= epoch then
+			finish("Not signed in", true)
+			return
+		end
+		-- Memory stands in when the Keychain cannot be read, or when the token was never saved there; if the
+		-- Keychain answers "nothing" for a token it did hold, the sign-in was removed (from another pane, say)
+		-- and this one is signed out too. A token from before a sign-out (in any pane) is not used.
+		local mem = if c.mem and c.mem_gen == signed_out then c.mem else nil
+		local stale = c.mem ~= nil and mem == nil -- the only candidate predates a sign-out: signed out, not an error to retry
+		local rt = token or (if gerr or c.unsaved then mem else nil) or legacy_token()
+		if rt then
+			request(rt, false)
+		elseif stale then
+			c.mem = nil
+			finish("Not signed in", true)
+		else
+			finish(gerr or "Not signed in", if gerr then nil else true)
 		end
 	end)
 end
@@ -384,6 +568,7 @@ function M.release_listener(mode: AuthMode)
 end
 
 function M.exchange(c: Client, code: string, verifier: string, cb: (Reply) -> ())
+	local epoch = c.epoch
 	token_request({
 		{ "grant_type", "authorization_code" },
 		{ "code", code },
@@ -391,13 +576,23 @@ function M.exchange(c: Client, code: string, verifier: string, cb: (Reply) -> ()
 		{ "client_id", c.client_id },
 		{ "code_verifier", verifier },
 	}, function(reply)
-		if reply.ok then
-			store(c, reply.json)
-			if not M.has_refresh_token() then
-				reply = { ok = false, status = reply.status, err = "Spotify returned no refresh token" }
-			end
+		if c.epoch ~= epoch then
+			cb({ ok = false, status = 0, err = "Not signed in" })
+			return
 		end
-		cb(reply)
+		if not reply.ok then
+			cb(reply)
+			return
+		end
+		local rt = if type(reply.json) == "table" then reply.json.refresh_token else nil
+		if type(rt) ~= "string" or rt == "" or not store_access(c, reply.json) then
+			cb({ ok = false, status = reply.status, err = "Spotify returned no refresh token" })
+			return
+		end
+		-- The sign-in works once the token is in memory; whether it is also saved is `c.warn`'s to say.
+		persist(c, epoch, rt, function()
+			cb(reply)
+		end)
 	end)
 end
 

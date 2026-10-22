@@ -1,9 +1,11 @@
 --!strict
 -- Block `spotify-api.web-player`: a Spotify Web API remote control with cover art, transport, volume,
--- device picker and track search. State lives in the block; credentials in tern.kv (see spotify.luau).
+-- device picker and track search. State lives in the block; the sign-in's refresh token in the macOS Keychain
+-- (secret.luau), the rest of the credentials in tern.kv (see spotify.luau).
 
 local ui = tern.ui
 local spotify = require("./spotify")
+local secret = require("./secret")
 local field = require("./field")
 local bridge = require("./bridge")
 local viz = require("./viz")
@@ -59,6 +61,7 @@ type State = {
 	devices: { spotify.Device },
 	dsel: number,
 	err: string?,
+	warn: string?, -- why the sign-in is not safely saved (the Keychain): shown until it is
 	inflight: boolean, -- a /me/player poll is in flight
 	ticking: boolean, -- the once-a-second tick has a timer waiting
 	timer: TimerHandle?,
@@ -335,6 +338,7 @@ poll = function(state: State, cx: BlockCx)
 				state.err = nil -- a command's error stays until the next command, so it can be read
 			end
 			state.phase = "ready"
+			state.warn = client.warn
 			local pb = spotify.parse_playback(reply.json)
 			keep_pending(state, pb, started)
 			local e = state.expect
@@ -1094,33 +1098,56 @@ local function enter_search(state: State, cx: BlockCx)
 	focus_op(cx, node_path(BOX.search, "query"))
 end
 
-local function sign_out(state: State)
+local function sign_out(state: State, cx: BlockCx)
 	cancel_debounced(state)
 	state.poll_fails = 0
 	if state.timer then
 		state.timer:cancel()
 		state.timer = nil
 	end
+	local function removed(ok: boolean, err: string?)
+		if not ok and alive(cx.pane) then
+			-- Nothing else would say it: the sign-in would come back at the next start.
+			state.warn = "Signed out, but the Keychain item could not be removed: " .. (err or "unknown error")
+			cx:render()
+		end
+	end
 	if state.client then
-		spotify.sign_out(state.client)
+		spotify.sign_out(state.client, removed)
+	else
+		spotify.forget(removed)
 	end
 	state.gen += 1
 	state.phase, state.mode = "login", "player"
-	state.playback, state.login, state.waiting, state.err = nil, nil, false, nil
+	state.playback, state.login, state.waiting, state.err, state.warn = nil, nil, false, nil, nil
 end
 
 -- Sign-in --------------------------------------------------------------------------------------
 
 -- Signs in with the saved token if there is one, else asks to sign in. Also where esc on the sign-in method
--- choice lands: the saved sign-in is still there after "Connecting", so try it again.
+-- choice lands: the saved sign-in is still there after "Connecting", so try it again. The Keychain answers
+-- asynchronously, so the pane says "Connecting" until it has.
 local function resume(state: State, cx: BlockCx)
 	state.poll_fails = 0
-	if spotify.has_refresh_token() then
-		state.phase = "loading"
-		poll(state, cx)
-	else
+	local client = state.client
+	if not client then
 		state.phase = "login"
+		return
 	end
+	state.phase = "loading"
+	spotify.load(client, function(has, warn)
+		if not alive(cx.pane) or state.client ~= client or state.phase ~= "loading" then
+			return -- the user went elsewhere (another method, a sign-out) while the Keychain answered
+		end
+		state.warn = if has then warn else nil
+		if has then
+			poll(state, cx)
+		else
+			state.phase = "login"
+			state.err = warn
+		end
+		cx:render()
+	end)
 end
 
 local function begin_client(state: State, cx: BlockCx, client_id: string, auth: spotify.AuthMode)
@@ -1128,6 +1155,10 @@ local function begin_client(state: State, cx: BlockCx, client_id: string, auth: 
 	state.auth = auth
 	state.client_id = client_id
 	local old = state.client
+	if old then
+		spotify.retire(old) -- an answer to one of its requests must not store a token any more
+	end
+	secret.reset(secret.default) -- a new choice by the user: the Keychain may be tried again
 	local client = spotify.new(client_id, auth)
 	if old and old.client_id == client_id then
 		-- Spotify limits per client id: choosing the same one again doesn't clear a wait it imposed.
@@ -1143,8 +1174,12 @@ end
 local function adopt(state: State, cx: BlockCx, auth: spotify.AuthMode, client_id: string)
 	local other_client = state.client ~= nil and state.client_id ~= client_id
 	if (tern.kv.get("auth_mode") or "own") ~= auth or other_client then
-		tern.kv.set("refresh_token", nil)
-		tern.kv.set("scope", nil)
+		spotify.forget(function(ok, err)
+			if not ok and alive(cx.pane) then
+				state.warn = "The old sign-in could not be removed from the Keychain: " .. (err or "unknown error")
+				cx:render()
+			end
+		end)
 	end
 	tern.kv.set("auth_mode", auth)
 	begin_client(state, cx, client_id, auth)
@@ -1175,6 +1210,7 @@ local function finish_login(state: State, cx: BlockCx, result: spotify.Callback)
 			if state.client ~= client or state.phase ~= "loading" then
 				return -- the user left for the choice of sign-in method meanwhile; a saved token is picked up when they come back
 			end
+			state.warn = client.warn
 			if reply.ok then
 				poll(state, cx)
 			else
@@ -1230,6 +1266,7 @@ local function start_login(state: State, cx: BlockCx)
 		return
 	end
 	state.err = nil
+	secret.reset(secret.default)
 	spotify.begin_login(client, function(login, err)
 		if not alive(cx.pane) then
 			return
@@ -1726,6 +1763,9 @@ local function build_view(state: State, cx: BlockCx): BlockView
 	if state.err then
 		table.insert(dock, ui.text({ ui.span(state.err, "error") }))
 	end
+	if state.warn then
+		table.insert(dock, ui.text({ ui.span(state.warn, "error") }))
+	end
 	if help ~= "" then
 		table.insert(dock, hint(help))
 	end
@@ -1872,7 +1912,7 @@ end
 local function key_player(state: State, key: Key, cx: BlockCx): boolean
 	local name = key.name
 	if key.text == "L" then
-		sign_out(state)
+		sign_out(state, cx)
 	elseif key.text == "P" then
 		sd_open(state, cx)
 	elseif is_help_key(key) then
@@ -1988,7 +2028,8 @@ end
 
 local player: BlockDef<State> = {
 	init = function(cx, _args, _saved)
-		-- The refresh token sits in this folder's kv.json: keep other local users out of it.
+		-- Only what is not secret sits in this folder's kv.json now (a token an earlier version left there is moved
+		-- to the Keychain when it is found): keep other local users out of it.
 		pcall(function()
 			tern.process.run({ "chmod", "700", tern.plugin.data }, function() end)
 		end)
@@ -2066,7 +2107,7 @@ local player: BlockDef<State> = {
 		elseif state.phase == "loading" then
 			-- Spotify may keep refusing (rate limit, no network): never leave the block with no way out.
 			if key.text == "L" then
-				sign_out(state)
+				sign_out(state, cx)
 				return true
 			elseif key.text == "e" or key.name == "escape" then
 				-- Only a way to choose another method: the saved sign-in stays until a different method is picked.

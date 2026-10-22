@@ -11,9 +11,55 @@ local reads = {} -- path -> how many times the plugin read it
 local queue = {} -- completed async work (fetch/process callbacks) waiting to run
 local fetch_log = {}
 local hold_polls = false -- keep the answers to /me/player polls until released (a slow network)
+local hold_token = false -- the same for the answers of the token endpoint
 local held_fetch = {}
 local routes = {} -- "METHOD host/path" -> function(req) -> { status, headers?, body? }
 local kv = {}
+
+-- The macOS Keychain, as /usr/bin/security answers it. `token` is the one item the plugin keeps there.
+-- mode: ok | locked (the call hangs behind a dialog until timeout_ms) | unavailable (security exits 1) |
+-- missing (spawning fails) | write_lost (`security -i` says nothing and stores nothing).
+local keychain = { token = nil :: string?, mode = "ok", log = {} :: { { kind: string, argv: { string }, stdin: string? } } }
+local SERVICE, ACCOUNT = "so.tern-spotify.refresh-token", "spotify"
+
+local function fake_security(argv, opts)
+	if keychain.mode == "missing" then
+		error("spawn /usr/bin/security: no such file")
+	elseif keychain.mode == "locked" then
+		return { status = -1, timed_out = true }
+	elseif keychain.mode == "unavailable" then
+		return { status = 1, stderr = "security: SecKeychainSearchCopyNext: User interaction is not allowed." }
+	end
+	local verb = argv[2]
+	if verb == "-i" then
+		local line = opts.stdin or ""
+		table.insert(keychain.log, { kind = "add", argv = argv, stdin = line })
+		local s, a, hex = string.match(line, "^add%-generic%-password %-U %-s (%S+) %-a (%S+) %-X (%x+)\n$")
+		if s ~= SERVICE or a ~= ACCOUNT then
+			return { status = 1 }
+		end
+		if keychain.mode ~= "write_lost" then
+			keychain.token = (string.gsub(hex, "%x%x", function(h)
+				return string.char(tonumber(h, 16) :: number)
+			end))
+		end
+		return { status = 0 }
+	end
+	table.insert(keychain.log, { kind = if verb == "find-generic-password" then "find" else "delete", argv = argv })
+	if argv[4] ~= SERVICE or argv[6] ~= ACCOUNT then
+		return { status = 1 }
+	elseif verb == "find-generic-password" then
+		if keychain.token == nil then
+			return { status = 44 }
+		end
+		return { status = 0, stdout = keychain.token .. "\n" }
+	elseif verb == "delete-generic-password" then
+		local had = keychain.token ~= nil
+		keychain.token = nil
+		return { status = if had then 0 else 44 }
+	end
+	return { status = 1 }
+end
 local pending_nc = nil
 local nc_port = nil -- the port the latest `nc` listener was asked for
 local opened = {}
@@ -330,7 +376,7 @@ local tern = {
 		local deliver = function()
 			cb({ status = res.status or 200, headers = res.headers or {}, body = res.body or "", error = res.error, timed_out = false })
 		end
-		if hold_polls and req.method == "GET" and path == "/v1/me/player" then
+		if (hold_polls and req.method == "GET" and path == "/v1/me/player") or (hold_token and path == "/api/token") then
 			table.insert(held_fetch, deliver)
 		else
 			table.insert(queue, deliver)
@@ -342,6 +388,13 @@ local tern = {
 				cb, opts = opts, {}
 			end
 			table.insert(proc_log, { argv = argv, opts = opts })
+			if argv[1] == "/usr/bin/security" then
+				local r = fake_security(argv, opts)
+				table.insert(queue, function()
+					cb({ status = r.status or 0, stdout = r.stdout or "", stderr = r.stderr or "", timed_out = r.timed_out or false })
+				end)
+				return
+			end
 			if proc_handler then
 				local r = proc_handler(argv, opts)
 				if r == "hold" then
@@ -484,10 +537,14 @@ local function calls(method, path)
 	return out
 end
 
+local forget_store: () -> () = function() end -- set once the modules are loaded (below)
+
 local function reset()
 	clock, timers, queue, fetch_log, kv, pending_nc, opened = 0, {}, {}, {}, {}, nil, {}
 	blob_log = {}
-	hold_polls, held_fetch = false, {}
+	hold_polls, hold_token, held_fetch = false, false, {}
+	keychain.token, keychain.mode, keychain.log = nil, "ok", {}
+	forget_store() -- the Keychain module's queue outlives a test that dropped a pending answer
 	copied = nil
 	files, dirs, proc_log, proc_handler, proc_held = {}, {}, {}, nil, {}
 	env = { HOME = "/Users/test" }
@@ -496,6 +553,11 @@ end
 
 --@modules
 local pkce = require("../pkce")
+local secret = require("../secret")
+forget_store = function()
+	local store = secret.default
+	store.queue, store.running, store.blocked = {}, false, nil
+end
 local spotify = require("../spotify")
 require("../host")
 local def = blocks["web-player"]
@@ -592,7 +654,7 @@ local function signed_in_player()
 	reset()
 	spotify_routes()
 	set_current(playback())
-	kv.client_id, kv.refresh_token = CLIENT_ID, "RT1"
+	kv.client_id, keychain.token = CLIENT_ID, "RT1"
 	local state = def.init(cx, {}, nil)
 	settle()
 	return state
@@ -632,6 +694,7 @@ do
 	check("own: empty id rejected", state.phase == "setup" and state.err ~= nil)
 	def.key(state, { name = "paste", text = " " .. string.upper(CLIENT_ID) .. "\n", ctrl = false, alt = false, shift = false, meta = false }, cx)
 	def.key(state, K("enter"), cx)
+	settle() -- the Keychain answers "no sign-in saved"
 	check("own: valid id moves to login", state.phase == "login" and state.auth == "own", state.phase)
 	check("own: id persisted lowercased", kv.client_id == CLIENT_ID, kv.client_id)
 	check("own: mode persisted", kv.auth_mode == "own")
@@ -659,6 +722,7 @@ do
 	def.event(state, { ev = "action", act = "mode_keymaster" }, cx)
 	check("keymaster: click opens the warning", state.setup == "keymaster")
 	def.event(state, { ev = "action", act = "keymaster_ok" }, cx)
+	settle()
 	check("keymaster: accepted -> login with the desktop client id", state.phase == "login" and state.auth == "keymaster" and state.client_id == KEYMASTER_ID, state.phase)
 	check("keymaster: choice remembered", kv.auth_mode == "keymaster" and kv.keymaster_ack == true and kv.client_id == nil)
 	check("keymaster: login view names it", string.find(view_text(def, state), "Keymaster", 1, true) ~= nil)
@@ -677,7 +741,7 @@ do
 	local exchange = calls("POST", "/api/token")[1]
 	local sent = exchange and form(exchange.body) or {}
 	check("keymaster: exchanged with its id and redirect", sent.client_id == KEYMASTER_ID and sent.redirect_uri == "http://127.0.0.1:8000/login", exchange and exchange.body)
-	check("keymaster: signed in", state.phase == "ready" and kv.refresh_token == "RT1", state.phase .. " / " .. tostring(state.err))
+	check("keymaster: signed in", state.phase == "ready" and keychain.token == "RT1" and kv.refresh_token == nil, state.phase .. " / " .. tostring(state.err))
 end
 
 -- 1c. Restarting keeps the way chosen, but never skips the warning, and an old install keeps working.
@@ -685,7 +749,7 @@ do
 	reset()
 	spotify_routes()
 	set_current(playback())
-	kv.auth_mode, kv.keymaster_ack, kv.refresh_token = "keymaster", true, "RT1"
+	kv.auth_mode, kv.keymaster_ack, keychain.token = "keymaster", true, "RT1"
 	local state = def.init(cx, {}, nil)
 	settle()
 	check("restart: keymaster resumes", state.auth == "keymaster" and state.phase == "ready", state.phase)
@@ -698,7 +762,7 @@ do
 	reset()
 	spotify_routes()
 	set_current(playback())
-	kv.client_id, kv.refresh_token = CLIENT_ID, "RT1" -- what versions before the choice stored
+	kv.client_id, keychain.token = CLIENT_ID, "RT1" -- what versions before the choice stored
 	state = def.init(cx, {}, nil)
 	settle()
 	check("restart: an earlier install stays on its own Client ID", state.auth == "own" and state.phase == "ready", state.phase)
@@ -710,15 +774,17 @@ do
 	spotify_routes()
 	kv.auth_mode, kv.keymaster_ack = "keymaster", true
 	local state = def.init(cx, {}, nil)
+	settle()
 	check("switch: starts on keymaster, signed out", state.phase == "login" and state.auth == "keymaster")
-	kv.refresh_token, kv.scope = "STALE", "x"
+	keychain.token, kv.scope = "STALE", "x"
 	def.key(state, K("e", "e"), cx)
 	check("switch: e opens the choice", state.phase == "setup" and state.setup == "choose")
 	def.key(state, K("1", "1"), cx)
 	def.key(state, { name = "paste", text = CLIENT_ID, ctrl = false, alt = false, shift = false, meta = false }, cx)
 	def.key(state, K("enter"), cx)
+	settle()
 	check("switch: now on its own id", state.auth == "own" and state.phase == "login" and kv.auth_mode == "own" and kv.client_id == CLIENT_ID, state.phase)
-	check("switch: the other token is gone", kv.refresh_token == nil and kv.scope == nil)
+	check("switch: the other token is gone", keychain.token == nil and kv.scope == nil)
 end
 
 -- 2. Full sign-in: PKCE challenge matches the verifier, state is checked, tokens stored, player loads.
@@ -727,6 +793,7 @@ do
 	spotify_routes()
 	kv.client_id = CLIENT_ID
 	local state = def.init(cx, {}, nil)
+	settle()
 	check("signin: no token -> login", state.phase == "login")
 	def.key(state, K("enter"), cx)
 	settle()
@@ -750,7 +817,7 @@ do
 	good({ status = 0, stdout = "GET /callback?code=CODE1&state=" .. string.sub(rand, 87, 108) .. " HTTP/1.1\r\n", stderr = "", timed_out = false })
 	settle()
 	check("signin: reached ready", state.phase == "ready", state.phase .. " / " .. tostring(state.err))
-	check("signin: refresh token stored", kv.refresh_token == "RT1")
+	check("signin: refresh token stored in the Keychain, not in kv", keychain.token == "RT1" and kv.refresh_token == nil)
 	check("signin: not waiting", not state.waiting)
 	check("signin: cover art loaded", state.art ~= nil and state.art.blob ~= nil and blob_log[1] ~= nil and blob_log[1].mime == "image/jpeg" and #blob_log[1].bytes == 8, state.art and state.art.blob)
 	check("signin: art url is the 300px image", state.art and state.art.url == "https://img.test/300")
@@ -765,6 +832,7 @@ do
 	spotify_routes()
 	kv.client_id = CLIENT_ID
 	local state = def.init(cx, {}, nil)
+	settle()
 	def.key(state, K("enter"), cx)
 	settle()
 	pending_nc({ status = 0, stdout = "GET /callback?code=CODE1&state=forged HTTP/1.1\r\n", stderr = "", timed_out = false })
@@ -778,6 +846,7 @@ do
 	spotify_routes()
 	kv.client_id = CLIENT_ID
 	local state = def.init(cx, {}, nil)
+	settle()
 	def.key(state, K("enter"), cx)
 	settle()
 	pending_nc({ status = 1, stdout = "", stderr = "nc: Address already in use", timed_out = false })
@@ -806,10 +875,10 @@ do
 	check("lifecycle: 401 refreshes exactly once", #calls("POST", "/api/token") == tokens + 1, #calls("POST", "/api/token") - tokens)
 	check("lifecycle: 401 retried with the fresh token", #calls("GET", "/v1/me/player") >= polls + 2 and state.phase == "ready" and state.err == nil, state.err)
 
-	kv.refresh_token = "revoked"
+	keychain.token = "revoked"
 	state.client.token = nil
 	advance(15000)
-	check("lifecycle: revoked refresh token signs out", state.phase == "login" and kv.refresh_token == nil, state.phase)
+	check("lifecycle: revoked refresh token signs out", state.phase == "login" and keychain.token == nil, state.phase)
 	check("lifecycle: sign-out view renders", #view_text(def, state) > 0)
 end
 
@@ -1371,7 +1440,7 @@ do
 		spotify_routes()
 		routes["GET api.spotify.com/v1/search"] = search
 		set_current(playback())
-		kv.client_id, kv.refresh_token, kv.scope = CLIENT_ID, "RT1", token_scope -- scope as stored by an earlier token reply
+		kv.client_id, keychain.token, kv.scope = CLIENT_ID, "RT1", token_scope -- scope as stored by an earlier token reply
 		local state = def.init(cx, {}, nil)
 		settle()
 		return state
@@ -1401,7 +1470,7 @@ do
 		return ok(200, { tracks = { items = { item } } })
 	end
 	set_current(playback())
-	kv.client_id, kv.refresh_token, kv.scope = CLIENT_ID, "RT1", token_scope
+	kv.client_id, keychain.token, kv.scope = CLIENT_ID, "RT1", token_scope
 	state = def.init(cx, {}, nil)
 	settle()
 	advance(1000)
@@ -1494,7 +1563,8 @@ end
 do
 	local state = signed_in_player()
 	def.key(state, K("l", "L"), cx)
-	check("sign out: credentials gone", kv.refresh_token == nil and state.phase == "login")
+	settle()
+	check("sign out: credentials gone", keychain.token == nil and state.phase == "login")
 	local n = #calls("GET", "/v1/me/player")
 	advance(60000)
 	check("sign out: polling stopped", #calls("GET", "/v1/me/player") == n)
@@ -1504,7 +1574,7 @@ end
 do
 	reset()
 	spotify_routes()
-	kv.client_id, kv.refresh_token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
+	kv.client_id, keychain.token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
 	routes["GET api.spotify.com/v1/me/player"] = function()
 		return { status = 429, headers = { ["retry-after"] = "5" }, body = jenc({ error = { status = 429, message = "API rate limit exceeded" } }) }
 	end
@@ -1514,24 +1584,26 @@ do
 	local text = view_text(def, state)
 	check("429 on first poll: still Connecting, with the reason and the way out", state.phase == "loading" and string.find(text, "Connecting to Spotify", 1, true) ~= nil and string.find(text, "Rate limited", 1, true) ~= nil and string.find(text, "other sign-in method", 1, true) ~= nil, text)
 	def.key(state, K("escape"), cx)
-	check("esc from Connecting: the choice of method, still signed in", state.phase == "setup" and state.setup == "choose" and kv.refresh_token == "RT1")
+	check("esc from Connecting: the choice of method, still signed in", state.phase == "setup" and state.setup == "choose" and keychain.token == "RT1")
 	local n = #calls("GET", "/v1/me/player")
 	advance(60000)
 	check("esc from Connecting: polling paused while you choose", #calls("GET", "/v1/me/player") == n and state.phase == "setup")
 	def.key(state, K("escape"), cx)
+	settle() -- the Keychain answers, then the poll goes out
 	check("esc from the choice: back to Connecting, trying again", state.phase == "loading" and #calls("GET", "/v1/me/player") == n + 1, #calls("GET", "/v1/me/player") - n)
 	def.key(state, K("e", "e"), cx)
 	def.key(state, K("1", "1"), cx)
 	check("...and your own Client ID can be picked", state.setup == "own")
 	def.key(state, { name = "paste", text = CLIENT_ID, ctrl = false, alt = false, shift = false, meta = false }, cx)
 	def.key(state, K("enter"), cx)
-	check("a different method drops the Keymaster sign-in", kv.refresh_token == nil and kv.auth_mode == "own" and state.phase == "login", state.phase)
+	settle()
+	check("a different method drops the Keymaster sign-in", keychain.token == nil and kv.auth_mode == "own" and state.phase == "login", state.phase)
 
 	-- e while a poll is in flight: its answer must not drag you out of the choice
 	reset()
 	spotify_routes()
 	set_current(playback())
-	kv.client_id, kv.refresh_token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
+	kv.client_id, keychain.token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
 	state = def.init(cx, {}, nil)
 	check("poll in flight: Connecting", state.phase == "loading")
 	def.key(state, K("e", "e"), cx)
@@ -1541,7 +1613,7 @@ do
 	-- A long wait imposed on the Keymaster client must not delay the first poll of the user's own one.
 	reset()
 	spotify_routes()
-	kv.client_id, kv.refresh_token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
+	kv.client_id, keychain.token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
 	routes["GET api.spotify.com/v1/me/player"] = function()
 		return { status = 429, headers = { ["retry-after"] = "600" }, body = jenc({ error = { status = 429, message = "API rate limit exceeded" } }) }
 	end
@@ -1552,12 +1624,13 @@ do
 	def.key(state, K("1", "1"), cx)
 	def.key(state, { name = "paste", text = CLIENT_ID, ctrl = false, alt = false, shift = false, meta = false }, cx)
 	def.key(state, K("enter"), cx)
-	check("another method: the old wait is dropped", spotify.retry_in(state.client) == 0 and kv.refresh_token == nil, spotify.retry_in(state.client))
+	settle()
+	check("another method: the old wait is dropped", spotify.retry_in(state.client) == 0 and keychain.token == nil, spotify.retry_in(state.client))
 
 	-- Choosing the SAME client again keeps the wait: Spotify limits per client id.
 	reset()
 	spotify_routes()
-	kv.client_id, kv.refresh_token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
+	kv.client_id, keychain.token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
 	routes["GET api.spotify.com/v1/me/player"] = function()
 		return { status = 429, headers = { ["retry-after"] = "600" }, body = jenc({ error = { status = 429, message = "API rate limit exceeded" } }) }
 	end
@@ -1568,7 +1641,7 @@ do
 	def.key(state, K("2", "2"), cx)
 	def.key(state, K("y", "y"), cx)
 	advance(10000)
-	check("same client again: the wait stays and nothing is sent", spotify.retry_in(state.client) > 500000 and #calls("GET", "/v1/me/player") == sent and kv.refresh_token == "RT1", #calls("GET", "/v1/me/player") - sent)
+	check("same client again: the wait stays and nothing is sent", spotify.retry_in(state.client) > 500000 and #calls("GET", "/v1/me/player") == sent and keychain.token == "RT1", #calls("GET", "/v1/me/player") - sent)
 
 	-- During a wait nothing goes out, whatever asks: the caller gets a 429 of its own, with the time left.
 	state = signed_in_player()
@@ -1634,7 +1707,7 @@ do
 	reset()
 	spotify_routes()
 	set_current(playback())
-	kv.client_id, kv.refresh_token, kv.auth_mode = CLIENT_ID, "RT1", "own"
+	kv.client_id, keychain.token, kv.auth_mode = CLIENT_ID, "RT1", "own"
 	state = def.init(cx, {}, nil)
 	settle()
 	check("own id: signed in", state.phase == "ready")
@@ -1644,18 +1717,19 @@ do
 	state.id_field.text, state.id_field.cursor = "", 0 -- "1" pre-fills the id in use; this one starts from scratch
 	def.key(state, { name = "paste", text = string.rep("b", 32), ctrl = false, alt = false, shift = false, meta = false }, cx)
 	def.key(state, K("enter"), cx)
-	check("another own Client ID drops the old token", kv.refresh_token == nil and state.phase == "login" and kv.client_id == string.rep("b", 32), tostring(kv.refresh_token))
+	settle()
+	check("another own Client ID drops the old token", keychain.token == nil and state.phase == "login" and kv.client_id == string.rep("b", 32), tostring(keychain.token))
 	def.key(state, K("e", "e"), cx)
 	def.key(state, K("1", "1"), cx)
 	-- "1" pre-fills the id in use: confirming it unchanged is the same client again
-	kv.refresh_token = "RT1"
+	keychain.token = "RT1"
 	def.key(state, K("enter"), cx)
-	check("the same own Client ID again keeps its token", kv.refresh_token == "RT1" and state.phase == "loading", tostring(kv.refresh_token))
+	check("the same own Client ID again keeps its token", keychain.token == "RT1" and state.phase == "loading", tostring(keychain.token))
 
 	-- The old client's answer arrives after the user picked a method again: it is not applied to the new session.
 	reset()
 	spotify_routes()
-	kv.client_id, kv.refresh_token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
+	kv.client_id, keychain.token, kv.auth_mode, kv.keymaster_ack = "65b708073fc0480ea92a077233ca87bd", "RT1", "keymaster", true
 	local answers = 0
 	routes["GET api.spotify.com/v1/me/player"] = function()
 		answers += 1
@@ -1664,10 +1738,19 @@ do
 		end
 		return { status = 204 }
 	end
-	state = def.init(cx, {}, nil) -- the first poll is in flight
+	hold_polls = true
+	state = def.init(cx, {}, nil)
+	settle() -- the first poll is in flight: its answer is held
+	check("old answer: the first poll is in flight", #held_fetch == 1, #held_fetch)
 	def.key(state, K("e", "e"), cx)
 	def.key(state, K("2", "2"), cx)
 	def.key(state, K("y", "y"), cx) -- Keymaster again: same id, the token stays, a new client polls
+	settle()
+	hold_polls = false
+	for _, deliver in held_fetch do
+		table.insert(queue, deliver) -- the old client's answer (a 429) first, then the new client's
+	end
+	held_fetch = {}
 	settle()
 	advance(10000)
 	check("old answer dropped: the new client polls and is ready", state.phase == "ready" and spotify.retry_in(state.client) == 0, state.phase)
@@ -1677,6 +1760,7 @@ do
 	spotify_routes()
 	kv.auth_mode, kv.keymaster_ack = "keymaster", true
 	state = def.init(cx, {}, nil)
+	settle()
 	def.key(state, K("enter"), cx)
 	settle()
 	local nc = pending_nc
@@ -2792,6 +2876,331 @@ do
 		settle()
 		check("auto device: shuffle with no device asks, it doesn't start music on Tern", state.mode == "devices" and #calls("PUT", "/v1/me/player") == 0 and #calls("PUT", "/v1/me/player/play") == 0 and #calls("GET", "/v1/me/player/devices") == 1, `{state.mode} {#calls("GET", "/v1/me/player/devices")}`)
 	end
+end
+
+-- 12. The refresh token lives in the macOS Keychain: never on a command line, never silently in kv.json.
+do
+	local secret = require("../secret")
+	local function spawns(verb)
+		local n = 0
+		for _, p in proc_log do
+			if p.argv[1] == "/usr/bin/security" and (verb == nil or p.argv[2] == verb) then
+				n += 1
+			end
+		end
+		return n
+	end
+
+	local script = secret.write_script("AbC-1_2.3~4+/=")
+	check("keychain: the token reaches `security -i` as hex on stdin, never as text", string.find(script, "AbC", 1, true) == nil and string.find(script, secret.hex("AbC-1_2.3~4+/="), 1, true) ~= nil and string.sub(script, -1) == "\n", script)
+	check("keychain: hex covers every byte", secret.hex("\0\255a") == "00ff61")
+	check("keychain: only token-shaped strings are written", not secret.valid("a b") and not secret.valid("") and not secret.valid("x\ny") and secret.valid("AQD-xyz_0.9~+/="))
+	check("keychain: odd keychain paths are refused", not pcall(secret.new, "/tmp/with space.keychain-db"))
+
+	-- A token an earlier version left in kv.json moves to the Keychain, and leaves kv.json once it reads back.
+	reset()
+	spotify_routes()
+	set_current(playback())
+	kv.client_id, kv.refresh_token = CLIENT_ID, "RT1"
+	local state = def.init(cx, {}, nil)
+	settle()
+	check("migration: signed in, the token is in the Keychain and gone from kv.json", state.phase == "ready" and keychain.token == "RT1" and kv.refresh_token == nil and state.warn == nil, `{state.phase} {tostring(keychain.token)} {tostring(kv.refresh_token)}`)
+	local kinds = {}
+	local leaked = false
+	for _, e in keychain.log do
+		table.insert(kinds, e.kind)
+		local argv_text = table.concat(e.argv, " ")
+		leaked = leaked or string.find(argv_text, "RT1", 1, true) ~= nil or string.find(argv_text, secret.hex("RT1"), 1, true) ~= nil or string.find(e.stdin or "", "RT1", 1, true) ~= nil
+	end
+	check("migration: looked, wrote, read back", kinds[1] == "find" and kinds[2] == "add" and kinds[3] == "find", table.concat(kinds, ","))
+	check("keychain: the token is on no command line (text or hex) and not in clear on stdin", not leaked)
+
+	-- The Keychain already holds the sign-in (a write whose job timed out, say): the plaintext copy goes.
+	reset()
+	spotify_routes()
+	set_current(playback())
+	kv.client_id, kv.refresh_token, keychain.token = CLIENT_ID, "OLD", "RT1"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("a plaintext copy next to a Keychain token is removed", state.phase == "ready" and kv.refresh_token == nil and keychain.token == "RT1", `{state.phase} {tostring(kv.refresh_token)}`)
+
+	-- ...and if the write does not take, the old copy keeps the login and the block says so.
+	reset()
+	spotify_routes()
+	set_current(playback())
+	kv.client_id, kv.refresh_token = CLIENT_ID, "RT1"
+	keychain.mode = "write_lost"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("migration that does not read back: still signed in from kv.json, with a warning", state.phase == "ready" and kv.refresh_token == "RT1" and keychain.token == nil and string.find(state.warn or "", "could not be saved", 1, true) ~= nil, `{state.phase} {tostring(state.warn)}`)
+	check("...and the warning is on screen", string.find(view_text(def, state), "could not be saved", 1, true) ~= nil)
+	keychain.mode = "ok"
+	state.client.token = nil -- the access token lapses: the next refresh saves the old token for good
+	advance(15000)
+	check("migration retried: the Keychain gets the token, kv.json loses it, the warning goes", keychain.token == "RT1" and kv.refresh_token == nil and state.warn == nil and state.phase == "ready", `{tostring(keychain.token)} {tostring(kv.refresh_token)} {tostring(state.warn)}`)
+
+	-- Keychain unreadable: the token from before keeps working; with none, the pane says why.
+	reset()
+	spotify_routes()
+	set_current(playback())
+	kv.client_id, kv.refresh_token = CLIENT_ID, "RT1"
+	keychain.mode = "unavailable"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("unreadable Keychain, token in kv.json: works, kept, warned", state.phase == "ready" and kv.refresh_token == "RT1" and string.find(state.warn or "", "could not be read", 1, true) ~= nil, `{state.phase} {tostring(state.warn)}`)
+	reset()
+	spotify_routes()
+	set_current(playback())
+	kv.client_id, kv.refresh_token = CLIENT_ID, "RT1"
+	keychain.mode = "unavailable"
+	hold_polls = true
+	state = def.init(cx, {}, nil)
+	settle()
+	check("the warning shows before the first poll answers", string.find(state.warn or "", "could not be read", 1, true) ~= nil, tostring(state.warn))
+	reset()
+	spotify_routes()
+	kv.client_id = CLIENT_ID
+	keychain.mode = "unavailable"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("unreadable Keychain, nothing in kv.json: login screen with the reason", state.phase == "login" and string.find(state.err or "", "Keychain", 1, true) ~= nil and kv.refresh_token == nil, `{state.phase} {tostring(state.err)}`)
+	reset()
+	spotify_routes()
+	kv.client_id = CLIENT_ID
+	keychain.mode = "missing"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("no /usr/bin/security to run: same, no crash", state.phase == "login" and string.find(state.err or "", "could not be run", 1, true) ~= nil, tostring(state.err))
+
+	-- A first sign-in with no usable Keychain works from memory, says it is not saved and never writes kv.json.
+	reset()
+	spotify_routes()
+	keychain.mode = "unavailable"
+	local client = spotify.new(CLIENT_ID, "own")
+	local got
+	spotify.exchange(client, "CODE1", string.rep("a", 86), function(r)
+		got = r
+	end)
+	settle()
+	check("exchange with no Keychain: signed in from memory, not saved, kv.json untouched", got ~= nil and got.ok and client.token ~= nil and client.mem == "RT1" and client.unsaved and client.warn ~= nil and kv.refresh_token == nil, tostring(client.warn))
+	client.token = nil -- the access token lapses: the refresh must still work from memory
+	local refreshed
+	spotify.request(client, "GET", "/me/player", nil, nil, function(r)
+		refreshed = r
+	end)
+	settle()
+	check("...and refreshing keeps working from memory", refreshed ~= nil and refreshed.ok, refreshed and refreshed.err)
+	keychain.mode = "ok"
+	client.token = nil
+	spotify.request(client, "GET", "/me/player", nil, nil, function() end)
+	settle()
+	check("...and the next refresh saves it once the Keychain answers", keychain.token == "RT1" and not client.unsaved and client.warn == nil, tostring(keychain.token))
+
+	-- A locked Keychain times out once; nothing more is spawned until the user tries again.
+	reset()
+	spotify_routes()
+	kv.client_id, keychain.token = CLIENT_ID, "RT1"
+	keychain.mode = "locked"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("locked Keychain: one attempt, and the screen says why", state.phase == "login" and string.find(state.err or "", "locked", 1, true) ~= nil and spawns() == 1, `{state.phase} {spawns()}`)
+	spotify.load(state.client, function() end)
+	settle()
+	check("locked Keychain: no second dialog is opened", spawns() == 1, spawns())
+	keychain.mode = "ok"
+	def.key(state, K("enter"), cx) -- a new sign-in attempt by the user
+	settle()
+	local before = spawns()
+	spotify.load(state.client, function() end)
+	settle()
+	check("...until the user tries again: `security` runs once more", spawns() == before + 1, `{before} -> {spawns()}`)
+
+	-- One queue: operations run in the order they were asked, whatever finishes first.
+	reset()
+	local order = {}
+	secret.delete(secret.default, function()
+		table.insert(order, "delete")
+	end)
+	secret.set(secret.default, "RT9", function(wrote)
+		table.insert(order, if wrote then "set" else "set-failed")
+	end)
+	secret.delete(secret.default, function()
+		table.insert(order, "delete2")
+	end)
+	settle()
+	check("queue: a delete never overtakes the write before it", table.concat(order, ",") == "delete,set,delete2" and keychain.token == nil, table.concat(order, ","))
+	secret.set(secret.default, "has space", function(wrote)
+		table.insert(order, if wrote then "bad-set" else "refused")
+	end)
+	settle()
+	check("queue: a token that is not token-shaped is refused before any spawn", order[#order] == "refused" and spawns("-i") == 1, tostring(order[#order]))
+
+	-- A callback that raises must not wedge the queue behind it.
+	reset()
+	keychain.token = "RT1"
+	secret.get(secret.default, function()
+		error("callback failed on purpose")
+	end)
+	local after
+	secret.get(secret.default, function(token)
+		after = token
+	end)
+	pcall(settle)
+	pcall(settle)
+	check("queue: a raising callback does not stop the next job", after == "RT1", tostring(after))
+
+	-- Two callers asking for the saved sign-in at once share one read.
+	reset()
+	keychain.token = "RT1"
+	client = spotify.new(CLIENT_ID, "own")
+	local answers = 0
+	spotify.load(client, function()
+		answers += 1
+	end)
+	spotify.load(client, function()
+		answers += 1
+	end)
+	settle()
+	local finds = 0
+	for _, e in keychain.log do
+		finds += if e.kind == "find" then 1 else 0
+	end
+	check("two loads at once: both answered, one Keychain read", answers == 2 and finds == 1, `{answers} {finds}`)
+
+	-- Sign-out removes the item; if it cannot, the block says so (the login would come back).
+	state = signed_in_player()
+	keychain.mode = "unavailable"
+	def.key(state, K("l", "L"), cx)
+	settle()
+	check("sign-out with an unreachable Keychain: signed out here, and says the item is still there", state.phase == "login" and string.find(state.warn or "", "could not be removed", 1, true) ~= nil, tostring(state.warn))
+
+	-- Another pane stored a newer token while this one was being refused: that one is tried, not wiped.
+	state = signed_in_player()
+	local real_route = routes["POST accounts.spotify.com/api/token"]
+	local token_calls = 0
+	routes["POST accounts.spotify.com/api/token"] = function(req)
+		token_calls += 1
+		if token_calls == 1 then
+			keychain.token = "RT1" -- stored by the other pane meanwhile
+		end
+		return real_route(req)
+	end
+	keychain.token = "STALE"
+	state.client.token = nil
+	advance(15000)
+	check("a refused token that another pane replaced: the new one is used and kept", state.phase == "ready" and keychain.token == "RT1" and token_calls >= 2, `{state.phase} {tostring(keychain.token)} {token_calls}`)
+
+	-- Signing out in one pane signs the other out too, when it next needs a token.
+	state = signed_in_player()
+	local other = def.init(cx, {}, nil)
+	settle()
+	check("two panes: both signed in", other.phase == "ready")
+	def.key(state, K("l", "L"), cx)
+	settle()
+	other.client.token = nil
+	advance(15000)
+	check("two panes: the other one is signed out at its next refresh", other.phase == "login" and keychain.token == nil, other.phase)
+
+	-- ...even when that other pane's refresh was already on the wire: its new token must not bring the sign-in back.
+	state = signed_in_player()
+	routes["POST accounts.spotify.com/api/token"] = function()
+		return ok(200, { access_token = "ATnew", expires_in = 3600, refresh_token = "RT2" })
+	end
+	other = def.init(cx, {}, nil)
+	settle()
+	hold_token = true
+	other.client.token = nil
+	advance(15000)
+	check("(setup) the other pane's refresh is in flight", #held_fetch == 1, #held_fetch)
+	def.key(state, K("l", "L"), cx)
+	settle()
+	hold_token = false
+	for _, deliver in held_fetch do
+		table.insert(queue, deliver)
+	end
+	held_fetch = {}
+	settle()
+	check("sign-out beats a refresh that was in flight in another pane", keychain.token == nil and other.phase == "login", `{tostring(keychain.token)} {other.phase}`)
+
+	-- A sign-in that could not be saved is not brought back by a later refresh once another pane signed out.
+	reset()
+	spotify_routes()
+	keychain.mode = "unavailable"
+	client = spotify.new(CLIENT_ID, "own")
+	spotify.exchange(client, "CODE1", string.rep("a", 86), function() end)
+	settle()
+	check("(setup) signed in from memory, not saved", client.unsaved and client.mem == "RT1")
+	keychain.mode = "ok"
+	spotify.forget() -- the user signs out in another pane
+	settle()
+	client.token = nil
+	local after_signout
+	spotify.request(client, "GET", "/me/player", nil, nil, function(r)
+		after_signout = r
+	end)
+	settle()
+	check("an unsaved sign-in from before another pane's sign-out is not saved back", keychain.token == nil and after_signout ~= nil and not after_signout.ok, tostring(keychain.token))
+
+	-- The same with the Keychain unreadable: signed out, not an error that is retried forever.
+	reset()
+	spotify_routes()
+	keychain.mode = "unavailable"
+	client = spotify.new(CLIENT_ID, "own")
+	spotify.exchange(client, "CODE1", string.rep("a", 86), function() end)
+	settle()
+	spotify.forget()
+	settle()
+	client.token = nil
+	local unreadable
+	spotify.request(client, "GET", "/me/player", nil, nil, function(r)
+		unreadable = r
+	end)
+	settle()
+	check("an unsaved sign-in from before a sign-out, Keychain unreadable: signed out", unreadable ~= nil and unreadable.auth == true, tostring(unreadable and unreadable.auth))
+
+	-- A sign-in finishing after the user signed out must not put the token back.
+	reset()
+	spotify_routes()
+	hold_token = true
+	client = spotify.new(CLIENT_ID, "own")
+	local late
+	spotify.exchange(client, "CODE1", string.rep("a", 86), function(r)
+		late = r
+	end)
+	settle()
+	spotify.sign_out(client)
+	hold_token = false
+	for _, deliver in held_fetch do
+		table.insert(queue, deliver)
+	end
+	held_fetch = {}
+	settle()
+	check("sign-out while a sign-in is in flight: nothing is saved afterwards", late ~= nil and keychain.token == nil and client.mem == nil and client.token == nil, tostring(keychain.token))
+
+	-- ...and one that ends while its save is running leaves no "not saved" notice behind.
+	reset()
+	spotify_routes()
+	keychain.mode = "unavailable"
+	client = spotify.new(CLIENT_ID, "own")
+	spotify.exchange(client, "CODE1", string.rep("a", 86), function() end)
+	local steps = 0
+	while client.mem == nil and #queue > 0 and steps < 50 do
+		steps += 1
+		table.remove(queue, 1)()
+	end
+	check("(setup) the save is under way", client.mem == "RT1", tostring(client.mem))
+	spotify.sign_out(client)
+	settle()
+	check("sign-out while the save runs: no stale notice, nothing kept", not client.unsaved and client.warn == nil and client.mem == nil, tostring(client.warn))
+
+	-- A legacy token that Spotify refuses is dropped from kv.json too, even with the Keychain out of reach.
+	reset()
+	spotify_routes()
+	kv.client_id, kv.refresh_token = CLIENT_ID, "STALE"
+	keychain.mode = "unavailable"
+	state = def.init(cx, {}, nil)
+	settle()
+	check("a refused kv.json token is removed, and the block signs out", kv.refresh_token == nil and state.phase == "login", `{tostring(kv.refresh_token)} {state.phase}`)
 end
 
 if failures > 0 then
