@@ -62,7 +62,8 @@ to end against Spotify's real servers.** Everything else in this README uses the
   under *User Management*.
 - **For Keymaster**, nothing to register. Read the warning the block shows.
 - **macOS** on the machine that runs Tern's daemon (a phone or a remote host only shows the pane). Sign-in uses
-  `sh`, `head`, `base64`, `tr` and `nc` (BSD netcat), all part of macOS.
+  `sh`, `head`, `base64`, `tr` and `nc` (BSD netcat), and the refresh token goes in the login Keychain through
+  `security`; all part of macOS.
 - [**Tern**](https://stencil.so/tern) with plugin support (`tern plugin ...`); 0.9.5 was used.
 - **Optional, for the local player:** [Homebrew](https://brew.sh). Warble installs `spotifyd` with it for you.
 
@@ -231,7 +232,7 @@ card into a split instead, use `F` or Tern's own picture-in-picture dock.
 | Floating, with the focus (click it, **Show player**, `f`), `shape=float` | a glass card: cover, equaliser, title and artist, progress with the times, controls, and the volume (speaker, `−`/`+`, meter) with the device that plays (click: picker); no album, `OPEN SPOTIFY` or `LOCAL PLAYER` badges. Links back to Spotify: click the cover (when one is shown), or `o` |
 | Floating without the focus, or parked, `shape=compact` | a glass card: cover, equaliser, title and artist, progress with the times, and the volume level with the device, read-only; no controls. Link back to Spotify: click the cover (when one is shown); keys don't reach this pane |
 
-A cover shows only when it belongs to the current track and has loaded. Errors always show. Every other screen is built from the same glass panels as the player. Search, devices, the local player and the shortcuts have a title row with a clickable `back` badge that does what `esc` does there (in the search field `esc` first moves to the results when there are any; the local player's badge cancels the step it is in, pairing, sign-in or starting, and does nothing while it installs, removes or saves). The setup, sign-in, loading and "Nothing playing" screens are titled glass panels with no badge. The shortcuts screen (`?`) is drawn in the docked and floating-with-focus views; a pane that is parked or floating without focus keeps showing the song card instead, and the screen is still there when the focus returns. The block can't see its own layout or focus, so the window half tells it: a shape event when the focus changes and when you park, float or dock, and once a second for changes that raise no event (Tern's own dock button). Only a change is sent. A block restarted without the window noticing starts docked until the shape changes. Nothing is written to disk and the sign-in in `kv.json` is never touched. The size of the floating window is Tern's: `layout:float` takes no size and `layout:resize` is documented for split dividers (I did not try it on a float), so the glass card stretches to the height of the pane (`flex: 1`) instead of the window shrinking to the card. In the isolated Tern a thin empty band stayed under the card; it is not the empty hint area (omitting that changed nothing) and I did not find out what it is.
+A cover shows only when it belongs to the current track and has loaded. Errors always show. Every other screen is built from the same glass panels as the player. Search, devices, the local player and the shortcuts have a title row with a clickable `back` badge that does what `esc` does there (in the search field `esc` first moves to the results when there are any; the local player's badge cancels the step it is in, pairing, sign-in or starting, and does nothing while it installs, removes or saves). The setup, sign-in, loading and "Nothing playing" screens are titled glass panels with no badge. The shortcuts screen (`?`) is drawn in the docked and floating-with-focus views; a pane that is parked or floating without focus keeps showing the song card instead, and the screen is still there when the focus returns. The block can't see its own layout or focus, so the window half tells it: a shape event when the focus changes and when you park, float or dock, and once a second for changes that raise no event (Tern's own dock button). Only a change is sent. A block restarted without the window noticing starts docked until the shape changes. Nothing is written to disk and the saved sign-in is never touched. The size of the floating window is Tern's: `layout:float` takes no size and `layout:resize` is documented for split dividers (I did not try it on a float), so the glass card stretches to the height of the pane (`flex: 1`) instead of the window shrinking to the card. In the isolated Tern a thin empty band stayed under the card; it is not the empty hint area (omitting that changed nothing) and I did not find out what it is.
 
 **Rendered** in an isolated Tern with fixture data (an SVG cover, not a JPEG), light and dark: docked, float with focus (volume and device included), the shortcuts screen opened by clicking `?`, and the search button; compact (volume and device read-only) was rendered in the same round through a click on the terminal, and in an earlier round through the real window half. The search (empty and with results), devices, local player, setup (choose, own app, Keymaster), sign-in, loading and "Nothing playing" screens were rendered docked in dark, search and the local player also in light, search at about 420 px wide and floating with focus, and a click on `back` was seen to return the search to the player (the render shows a click one frame late). **Not verified:** a real Spotify session or JPEG cover; the physical `?` key (Tern's test key sender cannot type it: the code accepts the typed `?`, the key `?`, and shift held on `/`, so on a layout where `?` is not shift+`/` it relies on the typed character arriving; this part is covered only by the flow tests, which use a fake runtime); delivery to a remote host; two windows on one session; that the search and Client ID fields take the focus when they open (their node id is built the same way as the list's `selected`, which was seen to highlight the right row, but the focus itself cannot be seen in a screenshot). **Known:** a narrow docked split (about 420 px) stacks the cover above the column and clips about 18 px at the bottom (seen in an earlier round); the shortcuts screen fits at 730×434 but a shorter pane would cut its last row (no scrolling found), and so does the local player's closing note; and a first `tern shot --theme both` run of the fixture showed an empty player twice, not diagnosed.
 
@@ -264,9 +265,25 @@ A cover shows only when it belongs to the current track and has loaded. Errors a
   Spotify sets with or without a market) is listed as "unavailable" and never sent, with the reason shown.
 - Every non-2xx reply is logged as a warning (`spotify <METHOD> <path> <status> <reason> <message>`, no
   query, no tokens) in Tern's log (`~/Library/Logs/Tern/tern-daemon.log`); healthy use logs nothing.
-- The refresh token is stored in the plugin's data folder (`<state>/plugin-data/spotify-api/kv.json`); the
-  block sets that folder to `0700`. Access tokens are kept in memory only. **Sign out** deletes the
-  refresh token.
+- **The refresh token lives in the macOS login Keychain** (service `so.tern-spotify.refresh-token`, account
+  `spotify`), written and read with `/usr/bin/security` from the host half. It is written as hex on the
+  stdin of `security -i`, so it never appears on a command line (`ps`), and every write is read back before
+  it counts. Tern's own `tern.secrets` is window-only and does not persist when headless, so it is not used.
+  Access tokens are kept in memory only. Still plain text in the plugin's data folder
+  (`<state>/plugin-data/spotify-api/kv.json`, which the block sets to `0700`): the Client ID, the granted
+  scopes, the sign-in mode and the Keymaster acknowledgement, none of them secret.
+  - A sign-in saved by an earlier version in `kv.json` is moved to the Keychain on the next start and removed
+    from `kv.json` only once it reads back. If the Keychain cannot be written, the old copy stays and the
+    block says so.
+  - If the Keychain cannot be read or written (locked, no GUI session, `security` missing), the session keeps
+    working from memory and the dock says the sign-in is not saved. The save is retried on each token refresh
+    while the Keychain answers. A locked Keychain makes `security` wait for an unlock dialog: after one 8 s
+    timeout no more `security` runs, so there are no retries and dialogs do not pile up, until you start a new
+    sign-in (or switch the sign-in mode) from the block.
+  - **Sign out** deletes the item (and any old `kv.json` copy); if the item cannot be removed the block
+    says so. By hand: `security delete-generic-password -s so.tern-spotify.refresh-token -a spotify`.
+  - Not verified here: a Keychain write from a GUI window session or a daemon with no login session, a real
+    unlock dialog, and which other programs the Keychain lets read the item.
 - Only the Web API's *current* endpoints are used (as of the Feb 2026 Development Mode changes):
   `/me/player*`, `/search` (limit ≤ 10).
 
@@ -278,7 +295,7 @@ luau tests/logic.test.luau    # callback parsing, encoding, text field
 luau tests/viz.test.luau      # the SVG generators: icons, play disc, volume meter
 sh tests/run-flow.sh          # host.luau against a fake Tern runtime and a scripted Spotify
 tern plugin types .           # writes tern.d.luau for luau-lsp
-luau-lsp analyze --platform=standard --definitions=@tern=tern.d.luau host.luau window.luau bridge.luau spotify.luau field.luau pkce.luau viz.luau spotifyd.luau ui/*.luau
+luau-lsp analyze --platform=standard --definitions=@tern=tern.d.luau host.luau window.luau bridge.luau spotify.luau secret.luau field.luau pkce.luau viz.luau spotifyd.luau ui/*.luau
 ```
 
 `ui/` holds the reusable pieces of the views: `core.luau` (set props, make a node clickable, a muted line, the id Tern gives a keyed node), `panel.luau` (the glass panel and the title row with its `back` badge), `list.luau` (the native list with keyed rows and a selected row) and `keycaps.luau` (the shortcuts' key groups). Their look is in `spotify.css` (`.sp-panel`, `.sp-row`, `.sp-keygroup`). A panel that holds an input or a list has a key, and that key is part of the node's id (`main.<panel key>.<node key>`); `selected` and the focus name the node by it, built with `core.node_path`. That the `selected` row highlights was seen in a render (an unkeyed panel made it stop); the focus ids are only checked against the fake runtime. Module names are matched by their last path segment in `tests/run-flow.sh`, so a `ui/` file must not share a name with a top-level module.
